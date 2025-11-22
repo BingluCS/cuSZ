@@ -69,7 +69,7 @@ class CompressorBuffer {
       d_ectrl = MAKE_UNIQUE_DEVICE(E, ALIGN_4Ki(len));
 
       if (is_comp) {
-        compact = new Compact(len / 5);
+        compact = new Compact(len);
         d_anchor = MAKE_UNIQUE_DEVICE(T, anchor512_len);
         d_hist = MAKE_UNIQUE_DEVICE(Freq, max_bklen);
         d_compressed = MAKE_UNIQUE_DEVICE(B, len * 4 / 2);
@@ -80,7 +80,7 @@ class CompressorBuffer {
     }
     else {
       if (toggle->err_ctrl_quant) d_ectrl = MAKE_UNIQUE_DEVICE(E, len);
-      if (toggle->compact_outlier) compact = new Compact(len / 5);
+      if (toggle->compact_outlier) compact = new Compact(len);
       if (toggle->anchor) d_anchor = MAKE_UNIQUE_DEVICE(T, anchor512_len);
       if (toggle->histogram) d_hist = MAKE_UNIQUE_DEVICE(Freq, max_bklen);
       if (toggle->compressed) {

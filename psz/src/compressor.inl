@@ -233,8 +233,76 @@ struct Compressor<DType>::impl {
     *out = mem->compressed();
     *outlen = pszheader_filesize(ctx->header);
   }
-
   void decompress_data_processing(psz_header* header, BYTE* in, T* out, psz_stream_t stream)
+  {
+    auto access = [&](int FIELD, szt offset_nbyte = 0) {
+      return (void*)(in + header->entry[FIELD] + offset_nbyte);
+    };
+
+    auto d_anchor = (T*)access(ANCHOR);
+    auto d_spval = (T*)access(SPFMT);
+    auto d_spidx = (M*)access(SPFMT, header->splen * sizeof(T));
+    auto d_space = out, d_xdata = out;  // aliases
+    auto len3_std = MAKE_STDLEN3(header->x, header->y, header->z);
+
+    eb = header->eb;
+    eb_r = 1 / eb, ebx2 = eb * 2, ebx2_r = 1 / ebx2;
+ 
+  if (header->splen > 0) {
+    if (header->splen > mem->compact_num_outliers()) {
+      delete mem->outlier();
+      size_t new_capacity = header->splen * 2; 
+      mem->compact = new _portable::compact_gpu<DType>(new_capacity);
+    }
+    
+
+    CHECK_GPU(cudaMemcpyAsync(
+        mem->compact_val(), d_spval, sizeof(T) * header->splen, 
+        cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
+    
+    CHECK_GPU(cudaMemcpyAsync(
+        mem->compact_idx(), d_spidx, sizeof(M) * header->splen, 
+        cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
+    CHECK_GPU(cudaMemsetAsync(mem->compact->num(), 0, sizeof(uint32_t), (cudaStream_t)stream));
+    CHECK_GPU(cudaMemcpyAsync(
+        mem->compact->num(), &header->splen, sizeof(uint32_t), 
+        cudaMemcpyHostToDevice, (cudaStream_t)stream));
+  }
+
+STEP_SCATTER:
+
+  if (header->splen != 0)
+    psz::spv_scatter_naive<PROPER_RUNTIME, T, M>(
+        mem->compact_val(), mem->compact_idx(), header->splen, d_space, &time_sp, stream);
+  STEP_DECODING:
+
+    if (header->codec1_type == Huffman)
+      codec_hf->decode((B*)access(ENCODED), mem->ectrl(), stream);
+    else if (header->codec1_type == FZGPUCodec)
+      codec_fzg->decode(
+          (B*)access(ENCODED), pszheader_filesize(header), mem->ectrl(), mem->len, stream);
+
+  STEP_PREDICT:
+
+    event_recording_start(event_start, stream);
+    if (header->pred_type == Lorenzo)
+      psz::module::GPU_x_lorenzo_nd<T, false, E>(
+          mem->ectrl(), d_space, d_xdata, len3_std, ebx2, ebx2_r, header->radius, stream);
+    else if (header->pred_type == LorenzoZigZag)
+      psz::module::GPU_x_lorenzo_nd<T, true, E>(
+          mem->ectrl(), d_space, d_xdata, len3_std, ebx2, ebx2_r, header->radius, stream);
+    else if (header->pred_type == LorenzoProto)
+      psz::module::GPU_PROTO_x_lorenzo_nd<T, E>(
+          mem->ectrl(), d_space, d_xdata, len3_std, ebx2, ebx2_r, header->radius, stream);
+    else if (header->pred_type == Spline)
+      psz::module::GPU_reverse_predict_spline(
+          mem->ectrl(), mem->ectrl_len3(), d_anchor, mem->anchor_len3(), d_xdata, len3_std, ebx2,
+          eb_r, header->radius, stream);
+
+    event_recording_stop(event_end, stream);
+    event_time_elapsed(event_start, event_end, &time_pred);
+  }
+  /*void decompress_data_processing(psz_header* header, BYTE* in, T* out, psz_stream_t stream)
   {
     auto access = [&](int FIELD, szt offset_nbyte = 0) {
       return (void*)(in + header->entry[FIELD] + offset_nbyte);
@@ -283,7 +351,7 @@ struct Compressor<DType>::impl {
     event_recording_stop(event_end, stream);
     event_time_elapsed(event_start, event_end, &time_pred);
   }
-
+*/
   void compress_collect_kerneltime()
   {
     if (not timerecord.empty()) timerecord.clear();
@@ -303,6 +371,37 @@ struct Compressor<DType>::impl {
       timerecord_v2[STAGE_BOOK] = codec_hf->time_book();
       timerecord_v2[STAGE_HUFFMAN] = codec_hf->time_lossless();
     }
+     float total_time = time_pred;
+     if (codec_hf) {
+       total_time += time_hist + codec_hf->time_book() + codec_hf->time_lossless();
+     }
+     printf("\n\e[1m\e[31mREPORT::COMPRESSION::TIME\e[0m\n");
+     printf("\n%-20s %-15s %-15s\n", "stage", "time (ms)", "GiB/s");
+     printf("--------------------------------------------------\n");
+     
+     if (time_pred > 0) {
+       float throughput = (len * sizeof(T)) / (time_pred * 1e-3) / (1024*1024*1024);
+       printf("%-20s %-15.3f %-15.2f\n", "predictor", time_pred, throughput);
+     }
+     
+     if (codec_hf && time_hist > 0) {
+       float throughput = (len * sizeof(T)) / (time_hist * 1e-3) / (1024*1024*1024);
+       printf("%-20s %-15.3f %-15.2f\n", "histogram", time_hist, throughput);
+     }
+     
+     if (codec_hf && codec_hf->time_book() > 0) {
+       float throughput = (len * sizeof(T)) / (codec_hf->time_book() * 1e-3) / (1024*1024*1024);
+       printf("%-20s %-15.3f %-15.2f\n", "codebook", codec_hf->time_book(), throughput);
+     }
+     
+     if (codec_hf && codec_hf->time_lossless() > 0) {
+       float throughput = (len * sizeof(T)) / (codec_hf->time_lossless() * 1e-3) / (1024*1024*1024);
+       printf("%-20s %-15.3f %-15.2f\n", "lossless", codec_hf->time_lossless(), throughput);
+     }
+     float total_throughput = (len * sizeof(T)) / (total_time * 1e-3) / (1024*1024*1024);
+     printf("--------------------------------------------------\n");
+     printf("%-20s %-15.3f %-15.2f\n", "TOTAL", total_time, total_throughput);
+     printf("--------------------------------------------------\n");
   }
 
   void decompress_collect_kerneltime()
@@ -317,7 +416,35 @@ struct Compressor<DType>::impl {
     timerecord_v2[STAGE_OUTLIER] = time_sp;
     if (codec_hf) { timerecord_v2[STAGE_HUFFMAN] = codec_hf->time_lossless(); }
     timerecord_v2[STAGE_PREDICT] = time_pred;
-  }
+     float total_time = time_pred + time_sp;
+     if (codec_hf) {
+       total_time += codec_hf->time_lossless();
+     }
+
+     printf("\n\e[1m\e[31mREPORT::deCOMPRESSION::TIME\e[0m\n");
+     printf("\n%-20s %-15s %-15s\n", "stage", "time (ms)", "GiB/s");
+     printf("--------------------------------------------------\n");
+     
+     if (time_sp > 0) {
+       uint32_t outlier_count = mem->compact_num_outliers();
+       float throughput = (len * sizeof(T)) / (time_sp * 1e-3) / (1024*1024*1024);
+       printf("%-20s %-15.3f %-15.2f\n", "outlier", time_sp, throughput);
+     }
+     
+     if (codec_hf && codec_hf->time_lossless() > 0) {
+       float throughput = (len * sizeof(T)) / (codec_hf->time_lossless() * 1e-3) / (1024*1024*1024);
+       printf("%-20s %-15.3f %-15.2f\n", "huffman-dec", codec_hf->time_lossless(), throughput);
+     }
+     
+     if (time_pred > 0) {
+       float throughput = (len * sizeof(T)) / (time_pred * 1e-3) / (1024*1024*1024);
+       printf("%-20s %-15.3f %-15.2f\n", "predictor", time_pred, throughput);
+     }
+     float total_throughput = (len * sizeof(T)) / (total_time * 1e-3) / (1024*1024*1024);
+     printf("--------------------------------------------------\n");
+     printf("%-20s %-15.3f %-15.2f\n", "TOTAL", total_time, total_throughput);
+     printf("--------------------------------------------------\n");
+   }
 };
 
 //------------------------------------------------------------------------------
